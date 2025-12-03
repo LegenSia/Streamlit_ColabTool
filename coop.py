@@ -1780,7 +1780,9 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
         else:
             for _, row in projects_df.iterrows():
                 pid = int(row["id"])
-                c1, c2, c3 = st.columns([3, 3, 2])
+
+                # 이름 + 버튼 (설명 입력 칸 제거, 버튼 영역은 파트랑 동일하게 1:1)
+                c1, c2 = st.columns([4, 2])
 
                 with c1:
                     new_name = st.text_input(
@@ -1789,25 +1791,19 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
                         key=f"proj_name_{pid}",
                         label_visibility="collapsed",
                     )
+
                 with c2:
-                    new_desc = st.text_input(
-                        "설명",
-                        value=row.get("description") or "",
-                        key=f"proj_desc_{pid}",
-                        label_visibility="collapsed",
-                    )
-                with c3:
-                    b1, b2 = st.columns(2)
+                    b1, b2 = st.columns(2)  # 파트와 동일 구조
                     with b1:
                         if st.button(
                             "저장",
                             key=f"proj_save_{pid}",
                             use_container_width=True,
                         ):
+                            # 설명은 여기서 안 바꾸고, 이름만 수정
                             update_project(
                                 pid,
                                 name=new_name.strip() or row["name"],
-                                description=new_desc.strip(),
                             )
                             st.success("프로젝트가 수정되었습니다.")
                             st.rerun()
