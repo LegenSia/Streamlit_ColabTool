@@ -2204,6 +2204,9 @@ else:
 
             col_todo, col_prog, col_done = st.columns(3)
 
+            priority_options = ["Low", "Medium", "High"]
+            priority_labels = {"Low": "낮음", "Medium": "보통", "High": "높음"}
+
             for label, col in [
                 ("Todo", col_todo),
                 ("In Progress", col_prog),
@@ -2302,8 +2305,6 @@ else:
                                         f"마감: {r['due_date'] or '-'} · 진행률: {task_progress}%"
                                     )
 
-
-                                                                        
                                     b_done, b_edit, b_del = st.columns(
                                         3, gap="small"
                                     )
@@ -2403,35 +2404,18 @@ else:
                                         key=f"edit_assignee_{task_id}",
                                     )
 
-                                    # 🔹 시작일 / 마감일 수정 가능하게
-                                    def _parse_date(v):
-                                        if isinstance(v, str) and v:
-                                            try:
-                                                return date.fromisoformat(v[:10])
-                                            except Exception:
-                                                pass
-                                        try:
-                                            if pd.notna(v):
-                                                return v.date()
-                                        except Exception:
-                                            pass
-                                        return date.today()
+                                    # 🔹 우선순위 수정 UI 추가
+                                    current_priority = r["priority"] or "Medium"
+                                    if current_priority not in priority_options:
+                                        current_priority = "Medium"
+                                    priority_val = st.selectbox(
+                                        "우선순위",
+                                        priority_options,
+                                        index=priority_options.index(current_priority),
+                                        format_func=lambda v: priority_labels.get(v, v),
+                                        key=f"edit_priority_{task_id}",
+                                    )
 
-                                    d1, d2 = st.columns(2)
-                                    with d1:
-                                        start_date_val = st.date_input(
-                                            "시작일",
-                                            value=_parse_date(r.get("start_date")),
-                                            key=f"edit_start_{task_id}",
-                                        )
-                                    with d2:
-                                        due_date_val = st.date_input(
-                                            "마감일",
-                                            value=_parse_date(r.get("due_date")),
-                                            key=f"edit_due_{task_id}",
-                                        )
-
-                                    # 🔹 서브태스크 편집
                                     subtasks = parse_subtasks(
                                         r.get("description") or ""
                                     )
@@ -2463,11 +2447,14 @@ else:
                                                 (lbl.strip(), weight_val, d_done)
                                             )
 
-                                    tags_val = st.text_input(
-                                        "태그(쉼표 구분)",
-                                        value=r.get("tags") or "",
-                                        key=f"edit_tags_{task_id}",
-                                    )
+                                    # 🔹 태그 입력 영역을 조금 줄이고 사용
+                                    c_tag, c_dummy = st.columns([3, 1])
+                                    with c_tag:
+                                        tags_val = st.text_input(
+                                            "태그(쉼표 구분)",
+                                            value=r.get("tags") or "",
+                                            key=f"edit_tags_{task_id}",
+                                        )
 
                                     b1, b2 = st.columns(2, gap="small")
                                     with b1:
@@ -2501,7 +2488,6 @@ else:
                                                 if assignee_val == "(없음)"
                                                 else assignee_val
                                             )
-
                                             update_task(
                                                 task_id,
                                                 title=title_val.strip()
@@ -2511,12 +2497,7 @@ else:
                                                 progress=int(new_prog),
                                                 assignee=assignee_final,
                                                 tags=tags_val.strip() or None,
-                                                start_date=start_date_val.isoformat()
-                                                if start_date_val
-                                                else None,
-                                                due_date=due_date_val.isoformat()
-                                                if due_date_val
-                                                else None,
+                                                priority=priority_val,
                                             )
                                             st.session_state[edit_key] = False
                                             st.success("수정되었습니다.")
@@ -2540,7 +2521,8 @@ else:
 
             with st.form(f"add_task_{part_id}"):
 
-                c_title, c_tag = st.columns([2, 1])
+                # 🔹 제목 / 태그 / 우선순위 한 줄에 배치
+                c_title, c_tag, c_pri = st.columns([2, 1, 1])
                 with c_title:
                     title = st.text_input(
                         "제목*",
@@ -2552,6 +2534,14 @@ else:
                         "태그(쉼표 구분)",
                         placeholder="백엔드,UI 등",
                         key=f"tag_input_{part_id}",
+                    )
+                with c_pri:
+                    new_priority = st.selectbox(
+                        "우선순위",
+                        priority_options,
+                        index=1,  # 기본: Medium(보통)
+                        format_func=lambda v: priority_labels.get(v, v),
+                        key=f"priority_new_{part_id}",
                     )
 
                 c1, c2 = st.columns(2)
@@ -2642,7 +2632,7 @@ else:
                             title=title.strip(),
                             description=description_str,
                             assignee=assignee_val,
-                            priority="Medium",
+                            priority=new_priority,  # 🔹 선택한 우선순위 저장
                             status=status,
                             start_date=start_date.isoformat()
                             if start_date
