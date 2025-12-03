@@ -658,6 +658,7 @@ def build_calendar_events(tasks_df, show_part_in_title=True):
         s = r.get("start_date")
         e = r.get("due_date")
 
+        # 날짜 기본값 보정
         if not s and e:
             s = e
         if not e and s:
@@ -665,6 +666,7 @@ def build_calendar_events(tasks_df, show_part_in_title=True):
         if not s and not e:
             s = e = date.today().isoformat()
 
+        # 문자열로 통일
         if not isinstance(s, str):
             try:
                 s = s.date().isoformat()
@@ -675,6 +677,13 @@ def build_calendar_events(tasks_df, show_part_in_title=True):
                 e = e.date().isoformat()
             except Exception:
                 e = s
+
+        # 🔹 allDay 이벤트는 end가 "전날"까지라서, 캘린더에만 +1일 적용
+        try:
+            e_date = date.fromisoformat(e)
+            e_plus = (e_date + timedelta(days=1)).isoformat()
+        except Exception:
+            e_plus = e
 
         title = r["title"]
         if show_part_in_title and isinstance(r.get("part_name"), str):
@@ -695,7 +704,7 @@ def build_calendar_events(tasks_df, show_part_in_title=True):
             "id": str(r["id"]),
             "title": title,
             "start": s,
-            "end": e,
+            "end": e_plus,          # 캘린더에는 +1일 적용된 값
             "allDay": True,
             "backgroundColor": color,
             "borderColor": color,
@@ -707,7 +716,6 @@ def build_calendar_events(tasks_df, show_part_in_title=True):
         }
         events.append(event)
     return events
-
 
 def calendar_options_base():
     return {
@@ -1312,6 +1320,30 @@ def render_part_board(
                                 key=f"edit_assignee_{task_id}",
                             )
 
+                            # 🔹 시작일 / 마감일 수정 가능
+                            def _parse_date(v):
+                                if isinstance(v, str) and v:
+                                    try:
+                                        return date.fromisoformat(v)
+                                    except Exception:
+                                        pass
+                                return date.today()
+
+                            c_d1, c_d2 = st.columns(2)
+                            with c_d1:
+                                start_date_val = st.date_input(
+                                    "시작일",
+                                    value=_parse_date(r.get("start_date")),
+                                    key=f"edit_start_{task_id}",
+                                )
+                            with c_d2:
+                                due_date_val = st.date_input(
+                                    "마감일",
+                                    value=_parse_date(r.get("due_date")),
+                                    key=f"edit_due_{task_id}",
+                                )
+
+                            # 🔹 서브태스크 편집
                             subtasks = parse_subtasks(
                                 r.get("description") or ""
                             )
@@ -1381,6 +1413,7 @@ def render_part_board(
                                         if assignee_val == "(없음)"
                                         else assignee_val
                                     )
+
                                     update_task(
                                         task_id,
                                         title=title_val.strip()
@@ -1390,6 +1423,12 @@ def render_part_board(
                                         progress=int(new_prog),
                                         assignee=assignee_final,
                                         tags=tags_val.strip() or None,
+                                        start_date=start_date_val.isoformat()
+                                        if start_date_val
+                                        else None,
+                                        due_date=due_date_val.isoformat()
+                                        if due_date_val
+                                        else None,
                                     )
                                     st.session_state[edit_key] = False
                                     st.success("수정되었습니다.")
