@@ -911,8 +911,36 @@ def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER, ro
     selected_day = date.fromisoformat(selected_day_str)
 
     def is_on_day(row):
-        due_str = str(row.get("due_date") or "")[:10]
-        return due_str == selected_day_str
+        """선택한 날짜가 작업 기간(start_date~due_date) 안에 들어가면 True"""
+
+        def _parse(v):
+            # 문자열이면 YYYY-MM-DD 로 파싱
+            if isinstance(v, str) and v:
+                try:
+                    return date.fromisoformat(v[:10])
+                except Exception:
+                    return None
+            # pandas Timestamp 등일 수 있는 경우
+            try:
+                if pd.notna(v):
+                    return v.date()
+            except Exception:
+                return None
+            return None
+
+        s = _parse(row.get("start_date"))
+        e = _parse(row.get("due_date"))
+
+        # 둘 다 없으면 이 날짜엔 안 보이게
+        if s is None and e is None:
+            return False
+        # 하나만 있으면 그 날 하루짜리로 취급
+        if s is None:
+            s = e
+        if e is None:
+            e = s
+
+        return s <= selected_day <= e
 
     day_tasks = (
         filtered[filtered.apply(is_on_day, axis=1)]
@@ -2314,6 +2342,35 @@ else:
                                         key=f"edit_assignee_{task_id}",
                                     )
 
+                                    # 🔹 시작일 / 마감일 수정 가능하게
+                                    def _parse_date(v):
+                                        if isinstance(v, str) and v:
+                                            try:
+                                                return date.fromisoformat(v[:10])
+                                            except Exception:
+                                                pass
+                                        try:
+                                            if pd.notna(v):
+                                                return v.date()
+                                        except Exception:
+                                            pass
+                                        return date.today()
+
+                                    d1, d2 = st.columns(2)
+                                    with d1:
+                                        start_date_val = st.date_input(
+                                            "시작일",
+                                            value=_parse_date(r.get("start_date")),
+                                            key=f"edit_start_{task_id}",
+                                        )
+                                    with d2:
+                                        due_date_val = st.date_input(
+                                            "마감일",
+                                            value=_parse_date(r.get("due_date")),
+                                            key=f"edit_due_{task_id}",
+                                        )
+
+                                    # 🔹 서브태스크 편집
                                     subtasks = parse_subtasks(
                                         r.get("description") or ""
                                     )
@@ -2383,6 +2440,7 @@ else:
                                                 if assignee_val == "(없음)"
                                                 else assignee_val
                                             )
+
                                             update_task(
                                                 task_id,
                                                 title=title_val.strip()
@@ -2392,6 +2450,12 @@ else:
                                                 progress=int(new_prog),
                                                 assignee=assignee_final,
                                                 tags=tags_val.strip() or None,
+                                                start_date=start_date_val.isoformat()
+                                                if start_date_val
+                                                else None,
+                                                due_date=due_date_val.isoformat()
+                                                if due_date_val
+                                                else None,
                                             )
                                             st.session_state[edit_key] = False
                                             st.success("수정되었습니다.")
