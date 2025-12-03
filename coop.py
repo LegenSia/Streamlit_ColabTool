@@ -47,6 +47,13 @@ def init_db():
         );
         """
         )
+        # 스키마 마이그레이션 (옛 테이블에 description 없을 수 있음)
+        cur.execute(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS description TEXT;"
+        )
+        cur.execute(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS created_at TEXT;"
+        )
 
         # parts
         cur.execute(
@@ -314,6 +321,19 @@ def update_project(project_id, **kwargs):
         conn.commit()
     # --- 캐시 무효화 ---
     list_projects.clear()
+
+
+def delete_project(project_id):
+    """프로젝트 삭제 (관련 tasks, user_projects 정리)"""
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE project_id=%s", (project_id,))
+        cur.execute("DELETE FROM user_projects WHERE project_id=%s", (project_id,))
+        cur.execute("DELETE FROM projects WHERE id=%s", (project_id,))
+        conn.commit()
+    list_projects.clear()
+    list_tasks.clear()
+    get_projects_for_user.clear()
 
 
 def insert_part(name, color="#3788d8"):
@@ -791,6 +811,706 @@ def completion_ratio(tasks_df: pd.DataFrame) -> int:
 
 
 # =========================================================
+# Fragment: 대시보드
+# =========================================================
+@st.fragment()
+def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER):
+    st.subheader("📊 대시보드 (전체 파트 일정)")
+
+    if not selected_project_id:
+        st.info("좌측에서 프로젝트를 선택하세요.")
+        return
+
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        part_filter_name = st.selectbox("파트 필터", ["전체"] + part_names)
+    with col1:
+        pass
+
+    all_tasks = list_tasks(project_id=selected_project_id)
+
+    if part_filter_name != "전체":
+        part_row = parts_df[parts_df["name"] == part_filter_name]
+        if not part_row.empty:
+            part_id_filter = int(part_row["id"].iloc[0])
+            filtered = list_tasks(
+                project_id=selected_project_id, part_id=part_id_filter
+            )
+        else:
+            filtered = all_tasks.iloc[0:0]
+    else:
+        filtered = all_tasks
+
+    events = build_calendar_events(filtered, show_part_in_title=True)
+    options = calendar_options_base()
+    cal_val = st_calendar(
+        events=events,
+        options=options,
+        key="dashboard_calendar",
+    )
+
+    key_sel = "dashboard_selected_date"
+    default_sel = st.session_state.get(key_sel, date.today().isoformat())
+    if isinstance(cal_val, dict) and cal_val.get("callback") == "dateClick":
+        dc = cal_val.get("dateClick", {})
+        raw = (dc.get("dateStr") or dc.get("date") or "")[:10]
+        if raw:
+            st.session_state[key_sel] = raw
+            default_sel = raw
+
+    selected_day = date.fromisoformat(default_sel)
+
+    def is_on_day(row):
+        due = row.get("due_date")
+        if isinstance(due, str) and due:
+            try:
+                d = date.fromisoformat(due)
+                return d == selected_day
+            except Exception:
+                return False
+        try:
+            if pd.notna(due):
+                return due.date() == selected_day
+        except Exception:
+            return False
+        return False
+
+    day_tasks = (
+        filtered[filtered.apply(is_on_day, axis=1)]
+        if not filtered.empty
+        else filtered
+    )
+
+    if not day_tasks.empty:
+        st.markdown(f"#### 선택한 날짜 일정 ({selected_day.isoformat()})")
+        show_cols = [
+            "id",
+            "title",
+            "part_name",
+            "assignee",
+            "status",
+            "priority",
+            "start_date",
+            "due_date",
+            "progress",
+            "tags",
+        ]
+        exist_cols = [c for c in show_cols if c in day_tasks.columns]
+        st.dataframe(
+            day_tasks[exist_cols], use_container_width=True, hide_index=True
+        )
+
+        # 상세 업무 삭제 기능 (대시보드에서)
+        with st.expander("🗑 선택한 날짜 작업 삭제", expanded=False):
+            options = [
+                f"[{int(row['id'])}] {row['title']}"
+                for _, row in day_tasks.iterrows()
+            ]
+            sel = st.selectbox(
+                "삭제할 작업 선택",
+                options,
+                key="day_task_delete_select",
+            )
+            if st.button("선택한 작업 삭제", key="day_task_delete_btn"):
+                sel_id_str = sel.split("]")[0].replace("[", "")
+                try:
+                    tid = int(sel_id_str)
+                    delete_task(tid)
+                    st.success("작업이 삭제되었습니다.")
+                    st.rerun()
+                except Exception:
+                    st.error("삭제 중 오류가 발생했습니다.")
+
+    br_col, graph_col = st.columns([2, 2])
+
+    with br_col:
+        st.markdown("#### 🧍 나의 할 일 브리핑")
+        if filtered.empty:
+            st.caption("현재 프로젝트에 등록된 작업이 없습니다.")
+        else:
+            my_tasks = filtered[filtered["assignee"] == CURRENT_USER]
+            if my_tasks.empty:
+                st.caption(
+                    f"현재 프로젝트/필터에서 {CURRENT_USER}에게 배정된 작업이 없습니다."
+                )
+            else:
+                total = len(my_tasks)
+                by_status = my_tasks["status"].value_counts().to_dict()
+
+                def parse_due(x):
+                    try:
+                        if isinstance(x, str) and x:
+                            return date.fromisoformat(x)
+                        if pd.notna(x):
+                            return x.date()
+                        return None
+                    except Exception:
+                        return None
+
+                my_tasks = my_tasks.copy()
+                my_tasks["due_dt"] = my_tasks["due_date"].apply(parse_due)
+                upcoming = my_tasks.dropna(subset=["due_dt"]).sort_values("due_dt")
+                if not upcoming.empty:
+                    next_due = upcoming.iloc[0]
+                    next_due_date = next_due["due_dt"].isoformat()
+                    next_due_title = next_due["title"]
+                else:
+                    next_due_date = "-"
+                    next_due_title = "-"
+
+                st.markdown(
+                    f"- 총 작업 수: **{total}건**  "
+                    f"(Todo: {by_status.get('Todo', 0)}, In Progress: {by_status.get('In Progress', 0)}, Done: {by_status.get('Done', 0)})"
+                )
+                st.markdown(
+                    f"- 가장 가까운 마감: **{next_due_date} · {next_due_title}**"
+                )
+
+    with graph_col:
+        st.markdown("#### 전체 / 파트 진행률")
+        if all_tasks is None or all_tasks.empty:
+            st.caption("진행률 데이터가 없습니다.")
+        else:
+            overall = completion_ratio(all_tasks)
+            items = []
+
+            items.append(
+                {
+                    "label": "전체",
+                    "value": overall,
+                    "color": "#4A5568",
+                }
+            )
+
+            for _, prow in parts_df.iterrows():
+                pid = prow["id"]
+                pname = prow["name"]
+                pcolor = (
+                    prow["color"]
+                    if isinstance(prow["color"], str) and prow["color"]
+                    else "#3788d8"
+                )
+                ptasks = all_tasks[all_tasks["part_id"] == pid]
+                val = completion_ratio(ptasks) if not ptasks.empty else 0
+                items.append(
+                    {
+                        "label": pname,
+                        "value": val,
+                        "color": pcolor,
+                    }
+                )
+
+            n_items = len(items)
+            max_cols = 4
+            idx = 0
+            while idx < n_items:
+                cols = st.columns(min(max_cols, n_items - idx))
+                for c in range(len(cols)):
+                    item = items[idx]
+                    with cols[c]:
+                        CircularProgress(
+                            label=item["label"],
+                            value=item["value"],
+                            key=f"cp_{item['label']}_{idx}",
+                            color=item["color"],
+                        ).st_circular_progress()
+                    idx += 1
+
+
+# =========================================================
+# Fragment: 파트별 보드
+# =========================================================
+@st.fragment()
+def render_part_board(
+    part_name,
+    selected_project_id,
+    parts_df,
+):
+    st.subheader(f"🗂 {part_name} 파트 작업 보드")
+
+    if not selected_project_id:
+        st.info("좌측에서 프로젝트를 선택하세요.")
+        return
+
+    part_row = parts_df[parts_df["name"] == part_name]
+    if part_row.empty:
+        st.error("해당 파트 정보를 찾을 수 없습니다.")
+        return
+
+    part_id = int(part_row["id"].iloc[0])
+    tdf = list_tasks(project_id=selected_project_id, part_id=part_id)
+
+    events = build_calendar_events(tdf, show_part_in_title=False)
+    options = calendar_options_base()
+    cal_val = st_calendar(
+        events=events,
+        options=options,
+        key=f"calendar_part_{part_id}",
+    )
+
+    key_sel = f"part_{part_id}_selected_date"
+    default_sel = st.session_state.get(key_sel, date.today().isoformat())
+    if isinstance(cal_val, dict) and cal_val.get("callback") == "dateClick":
+        dc = cal_val.get("dateClick", {})
+        raw = (dc.get("dateStr") or dc.get("date") or "")[:10]
+        if raw:
+            st.session_state[key_sel] = raw
+            default_sel = raw
+    selected_day = date.fromisoformat(default_sel)
+
+    with st.expander("🔍 필터", expanded=False):
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            assignee_filter = st.text_input("담당자(부분일치)")
+        with f2:
+            status_filter = st.multiselect(
+                "상태", ["Todo", "In Progress", "Done"]
+            )
+        with f3:
+            priority_filter = st.multiselect(
+                "우선순위", ["Low", "Medium", "High"]
+            )
+        with f4:
+            tag_filter = st.text_input("태그(부분일치)")
+
+        def apply_filters(df):
+            if df.empty:
+                return df
+            res = df.copy()
+            if assignee_filter:
+                res = res[
+                    res["assignee"]
+                    .fillna("")
+                    .str.contains(assignee_filter, case=False)
+                ]
+            if status_filter:
+                res = res[res["status"].isin(status_filter)]
+            if priority_filter:
+                res = res[res["priority"].isin(priority_filter)]
+            if tag_filter:
+                res = res[
+                    res["tags"]
+                    .fillna("")
+                    .str.contains(tag_filter, case=False)
+                ]
+            return res
+
+    tdf_f = apply_filters(tdf) if not tdf.empty else tdf
+
+    part_users_df = get_users_for_part(part_id)
+    if not part_users_df.empty:
+        user_options = ["(없음)"] + part_users_df["name"].tolist()
+    else:
+        user_options = ["(없음)"]
+
+    col_todo, col_prog, col_done = st.columns(3)
+
+    for label, col in [
+        ("Todo", col_todo),
+        ("In Progress", col_prog),
+        ("Done", col_done),
+    ]:
+        with col:
+            st.markdown(f"### {label}")
+            df_col = tdf_f[tdf_f["status"] == label]
+            if df_col.empty:
+                st.caption("비어 있음")
+            else:
+                for _, r in df_col.iterrows():
+                    task_id = int(r["id"])
+                    edit_key = f"edit_mode_{task_id}"
+                    edit_mode = st.session_state.get(edit_key, False)
+
+                    with st.container(border=True):
+                        priority = r["priority"] or "Medium"
+                        pr_label, pr_color = priority_label_and_color(priority)
+
+                        if not edit_mode:
+                            # 보기 모드
+                            st.markdown(
+                                f"""
+                                <div style="display:flex;align-items:center;gap:8px;">
+                                  <span style="font-weight:600;">{r['title']}</span>
+                                  <span style="font-size:0.8rem;padding:2px 8px;border-radius:999px;
+                                               background-color:{pr_color};color:#000;">
+                                    {pr_label}
+                                  </span>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+
+                            # 서브태스크 체크 → 상태/진행률 자동 반영
+                            subtasks_orig = parse_subtasks(
+                                r.get("description") or ""
+                            )
+                            if subtasks_orig:
+                                task_status = r.get("status") or "Todo"
+                                # Done이면 화면에서도 모두 체크
+                                if task_status == "Done":
+                                    subtasks_for_view = [
+                                        (lbl, weight, True)
+                                        for (lbl, weight, done) in subtasks_orig
+                                    ]
+                                else:
+                                    subtasks_for_view = subtasks_orig[:]
+
+                                changed = False
+                                new_subtasks = []
+                                for i, (
+                                    lbl,
+                                    weight,
+                                    done_flag,
+                                ) in enumerate(subtasks_for_view):
+                                    key_cb = f"subtask_cb_{task_id}_{i}"
+                                    checked = st.checkbox(
+                                        f"{lbl} ({weight}%)",
+                                        value=done_flag,
+                                        key=key_cb,
+                                    )
+                                    if checked != done_flag:
+                                        changed = True
+                                    new_subtasks.append((lbl, weight, checked))
+
+                                if changed:
+                                    new_desc = serialize_subtasks(new_subtasks)
+                                    new_prog = calc_progress_from_subtasks(
+                                        new_subtasks
+                                    )
+
+                                    if new_prog == 0:
+                                        new_status = "Todo"
+                                    elif new_prog == 100:
+                                        new_status = "Done"
+                                    else:
+                                        new_status = "In Progress"
+
+                                    update_task(
+                                        task_id,
+                                        description=new_desc,
+                                        progress=int(new_prog),
+                                        status=new_status,
+                                    )
+                                    st.rerun()
+
+                            # 진행률/담당/마감 표시
+                            st.caption(
+                                f"담당: {r['assignee'] or '-'} · "
+                                f"마감: {r['due_date'] or '-'} · 진행률: {r.get('progress') or 0}%"
+                            )
+
+                            b_done, b_edit, b_del = st.columns(3, gap="small")
+                            with b_done:
+                                if st.button(
+                                    "완료",
+                                    key=f"done_btn_{task_id}",
+                                    use_container_width=True,
+                                ):
+                                    subtasks_all = parse_subtasks(
+                                        r.get("description") or ""
+                                    )
+                                    if subtasks_all:
+                                        new_subtasks_all = [
+                                            (lbl, w, True)
+                                            for (lbl, w, d) in subtasks_all
+                                        ]
+                                        new_desc = serialize_subtasks(
+                                            new_subtasks_all
+                                        )
+                                    else:
+                                        new_desc = r.get("description") or None
+                                    update_task(
+                                        task_id,
+                                        status="Done",
+                                        progress=100,
+                                        description=new_desc,
+                                    )
+                                    st.rerun()
+                            with b_edit:
+                                if st.button(
+                                    "수정",
+                                    key=f"edit_btn_{task_id}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state[edit_key] = True
+                                    st.rerun()
+                            with b_del:
+                                if st.button(
+                                    "삭제",
+                                    key=f"del_{task_id}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state[
+                                        f"confirm_del_task_{task_id}"
+                                    ] = True
+
+                            if st.session_state.get(
+                                f"confirm_del_task_{task_id}"
+                            ):
+                                st.warning(
+                                    "정말 삭제할까요? 아래 버튼을 누르면 삭제됩니다."
+                                )
+                                c1, c2 = st.columns([1, 1])
+                                with c1:
+                                    if st.button(
+                                        "네, 삭제합니다",
+                                        key=f"confirm_del_task_btn_{task_id}",
+                                        use_container_width=True,
+                                    ):
+                                        delete_task(task_id)
+                                        st.session_state.pop(
+                                            f"confirm_del_task_{task_id}", None
+                                        )
+                                        st.warning("작업이 삭제되었습니다.")
+                                        st.rerun()
+                                with c2:
+                                    if st.button(
+                                        "취소",
+                                        key=f"cancel_del_task_{task_id}",
+                                        use_container_width=True,
+                                    ):
+                                        st.session_state.pop(
+                                            f"confirm_del_task_{task_id}", None
+                                        )
+
+                        else:
+                            # 수정 모드
+                            st.markdown("**수정 모드**")
+                            title_val = st.text_input(
+                                "제목",
+                                value=r["title"],
+                                key=f"edit_title_{task_id}",
+                            )
+
+                            assignee_current = r["assignee"] or "(없음)"
+                            assignee_val = st.selectbox(
+                                "담당자",
+                                user_options,
+                                index=user_options.index(assignee_current)
+                                if assignee_current in user_options
+                                else 0,
+                                key=f"edit_assignee_{task_id}",
+                            )
+
+                            subtasks = parse_subtasks(
+                                r.get("description") or ""
+                            )
+                            n_rows = max(len(subtasks), 1)
+                            edit_subtasks = []
+
+                            for i in range(n_rows):
+                                if i < len(subtasks):
+                                    d_label, d_weight, d_done = subtasks[i]
+                                else:
+                                    d_label, d_weight, d_done = "", 0, False
+                                c_l, c_p = st.columns([4, 1])
+                                with c_l:
+                                    lbl = st.text_input(
+                                        f"세부 작업 {i+1}",
+                                        value=d_label,
+                                        key=f"edit_sub_label_{task_id}_{i}",
+                                    )
+                                with c_p:
+                                    weight_val = st.number_input(
+                                        "할당률 (%)",
+                                        min_value=0,
+                                        max_value=100,
+                                        value=int(d_weight),
+                                        key=f"edit_sub_prog_{task_id}_{i}",
+                                    )
+                                if lbl.strip():
+                                    edit_subtasks.append(
+                                        (lbl.strip(), weight_val, d_done)
+                                    )
+
+                            tags_val = st.text_input(
+                                "태그(쉼표 구분)",
+                                value=r.get("tags") or "",
+                                key=f"edit_tags_{task_id}",
+                            )
+
+                            b1, b2 = st.columns(2, gap="small")
+                            with b1:
+                                if st.button(
+                                    "저장",
+                                    key=f"save_edit_{task_id}",
+                                    use_container_width=True,
+                                ):
+                                    if edit_subtasks:
+                                        new_desc = serialize_subtasks(
+                                            edit_subtasks
+                                        )
+                                        new_prog = (
+                                            calc_progress_from_subtasks(
+                                                edit_subtasks
+                                            )
+                                        )
+                                    else:
+                                        new_desc = None
+                                        new_prog = 0
+
+                                    if new_prog == 0:
+                                        new_status = "Todo"
+                                    elif new_prog == 100:
+                                        new_status = "Done"
+                                    else:
+                                        new_status = "In Progress"
+
+                                    assignee_final = (
+                                        None
+                                        if assignee_val == "(없음)"
+                                        else assignee_val
+                                    )
+                                    update_task(
+                                        task_id,
+                                        title=title_val.strip()
+                                        or r["title"],
+                                        status=new_status,
+                                        description=new_desc,
+                                        progress=int(new_prog),
+                                        assignee=assignee_final,
+                                        tags=tags_val.strip() or None,
+                                    )
+                                    st.session_state[edit_key] = False
+                                    st.success("수정되었습니다.")
+                                    st.rerun()
+                            with b2:
+                                if st.button(
+                                    "취소",
+                                    key=f"cancel_edit_{task_id}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state[edit_key] = False
+                                    st.rerun()
+
+    # 새 작업 추가
+    st.divider()
+    st.markdown("### ➕ 새 작업 추가")
+
+    count_key = f"subtask_count_{part_id}"
+    if count_key not in st.session_state:
+        st.session_state[count_key] = 1
+
+    with st.form(f"add_task_{part_id}"):
+
+        c_title, c_tag = st.columns([2, 1])
+        with c_title:
+            title = st.text_input(
+                "제목*",
+                placeholder="예: API 연동 구현",
+                key=f"title_input_{part_id}",
+            )
+        with c_tag:
+            tags = st.text_input(
+                "태그(쉼표 구분)",
+                placeholder="백엔드,UI 등",
+                key=f"tag_input_{part_id}",
+            )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            assignee_choice = st.selectbox(
+                "담당자", user_options, key=f"assignee_{part_id}"
+            )
+        with c2:
+            status = st.selectbox(
+                "상태",
+                ["Todo", "In Progress", "Done"],
+                key=f"status_new_{part_id}",
+            )
+
+        c3, c4 = st.columns(2)
+        with c3:
+            start_date = st.date_input(
+                "시작일",
+                value=selected_day,
+                key=f"start_{part_id}",
+            )
+        with c4:
+            due_date = st.date_input(
+                "마감일",
+                value=selected_day,
+                key=f"due_{part_id}",
+            )
+
+        sub_labels = []
+        sub_weights = []
+        for i in range(st.session_state[count_key]):
+            c_l, c_p = st.columns([3, 1])
+            with c_l:
+                lbl = st.text_input(
+                    f"세부 작업 {i+1}",
+                    key=f"new_sub_label_{part_id}_{i}",
+                )
+            with c_p:
+                prog_val = st.number_input(
+                    "할당률 (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=0,
+                    key=f"new_sub_prog_{part_id}_{i}",
+                )
+            if lbl.strip():
+                sub_labels.append(lbl.strip())
+                sub_weights.append(prog_val)
+
+        b1, b2 = st.columns(2, gap="small")
+        add_clicked = b1.form_submit_button(
+            "세부 작업 추가", use_container_width=True
+        )
+        save_clicked = b2.form_submit_button(
+            "저장", use_container_width=True
+        )
+
+        if add_clicked:
+            st.session_state[count_key] += 1
+
+        if save_clicked:
+            if not title.strip():
+                st.error("제목은 필수입니다.")
+            else:
+                if assignee_choice == "(없음)":
+                    assignee_val = None
+                else:
+                    assignee_val = assignee_choice
+
+                subtasks_new = []
+                for lbl, w in zip(sub_labels, sub_weights):
+                    done_flag = True if status == "Done" else False
+                    subtasks_new.append((lbl, w, done_flag))
+
+                if subtasks_new:
+                    description_str = serialize_subtasks(subtasks_new)
+                else:
+                    description_str = None
+
+                if status == "Done":
+                    progress = 100
+                else:
+                    progress = 0
+
+                insert_task(
+                    project_id=selected_project_id,
+                    part_id=part_id,
+                    title=title.strip(),
+                    description=description_str,
+                    assignee=assignee_val,
+                    priority="Medium",
+                    status=status,
+                    start_date=start_date.isoformat()
+                    if start_date
+                    else None,
+                    due_date=due_date.isoformat()
+                    if due_date
+                    else None,
+                    progress=int(progress),
+                    tags=tags.strip() or None,
+                )
+                st.success("작업이 추가되었습니다.")
+                st.rerun()
+
+
+# =========================================================
 # Streamlit 설정 및 로그인
 # =========================================================
 st.set_page_config(page_title="협업툴 - 일정/진행도", layout="wide")
@@ -927,180 +1647,7 @@ else:
 # 대시보드
 # =========================================================
 if current_tab == "대시보드":
-    st.subheader("📊 대시보드 (전체 파트 일정)")
-
-    if not selected_project_id:
-        st.info("좌측에서 프로젝트를 선택하세요.")
-    else:
-        col1, col2 = st.columns([3, 1])
-        with col2:
-            part_filter_name = st.selectbox("파트 필터", ["전체"] + part_names)
-        with col1:
-            pass
-
-        all_tasks = list_tasks(project_id=selected_project_id)
-
-        if part_filter_name != "전체":
-            part_row = parts_df[parts_df["name"] == part_filter_name]
-            if not part_row.empty:
-                part_id_filter = int(part_row["id"].iloc[0])
-                filtered = list_tasks(
-                    project_id=selected_project_id, part_id=part_id_filter
-                )
-            else:
-                filtered = all_tasks.iloc[0:0]
-        else:
-            filtered = all_tasks
-
-        events = build_calendar_events(filtered, show_part_in_title=True)
-        options = calendar_options_base()
-        cal_val = st_calendar(
-            events=events,
-            options=options,
-            key="dashboard_calendar",
-        )
-
-        key_sel = "dashboard_selected_date"
-        default_sel = st.session_state.get(key_sel, date.today().isoformat())
-        if isinstance(cal_val, dict) and cal_val.get("callback") == "dateClick":
-            d_str = cal_val["dateClick"]["date"][:10]
-            st.session_state[key_sel] = d_str
-            default_sel = d_str
-        selected_day = date.fromisoformat(default_sel)
-
-        def is_on_day(row):
-            due = row.get("due_date")
-            if isinstance(due, str) and due:
-                try:
-                    d = date.fromisoformat(due)
-                    return d == selected_day
-                except Exception:
-                    return False
-            try:
-                if pd.notna(due):
-                    return due.date() == selected_day
-            except Exception:
-                return False
-            return False
-
-        day_tasks = (
-            filtered[filtered.apply(is_on_day, axis=1)]
-            if not filtered.empty
-            else filtered
-        )
-
-        if not day_tasks.empty:
-            st.markdown("#### 선택한 날짜 일정")
-            show_cols = [
-                "title",
-                "part_name",
-                "assignee",
-                "status",
-                "priority",
-                "start_date",
-                "due_date",
-                "progress",
-                "tags",
-            ]
-            exist_cols = [c for c in show_cols if c in day_tasks.columns]
-            st.dataframe(
-                day_tasks[exist_cols], use_container_width=True, hide_index=True
-            )
-
-        br_col, graph_col = st.columns([2, 2])
-
-        with br_col:
-            st.markdown("#### 🧍 나의 할 일 브리핑")
-            if filtered.empty:
-                st.caption("현재 프로젝트에 등록된 작업이 없습니다.")
-            else:
-                my_tasks = filtered[filtered["assignee"] == CURRENT_USER]
-                if my_tasks.empty:
-                    st.caption(
-                        "현재 프로젝트/필터에서 기획자 A에게 배정된 작업이 없습니다."
-                    )
-                else:
-                    total = len(my_tasks)
-                    by_status = my_tasks["status"].value_counts().to_dict()
-
-                    def parse_due(x):
-                        try:
-                            if isinstance(x, str) and x:
-                                return date.fromisoformat(x)
-                            if pd.notna(x):
-                                return x.date()
-                            return None
-                        except Exception:
-                            return None
-
-                    my_tasks = my_tasks.copy()
-                    my_tasks["due_dt"] = my_tasks["due_date"].apply(parse_due)
-                    upcoming = my_tasks.dropna(subset=["due_dt"]).sort_values("due_dt")
-                    if not upcoming.empty:
-                        next_due = upcoming.iloc[0]
-                        next_due_date = next_due["due_dt"].isoformat()
-                        next_due_title = next_due["title"]
-                    else:
-                        next_due_date = "-"
-                        next_due_title = "-"
-
-                    st.markdown(
-                        f"- 총 작업 수: **{total}건**  "
-                        f"(Todo: {by_status.get('Todo', 0)}, In Progress: {by_status.get('In Progress', 0)}, Done: {by_status.get('Done', 0)})"
-                    )
-                    st.markdown(
-                        f"- 가장 가까운 마감: **{next_due_date} · {next_due_title}**"
-                    )
-
-        with graph_col:
-            st.markdown("#### 전체 / 파트 진행률")
-            if all_tasks is None or all_tasks.empty:
-                st.caption("진행률 데이터가 없습니다.")
-            else:
-                overall = completion_ratio(all_tasks)
-                items = []
-
-                items.append(
-                    {
-                        "label": "전체",
-                        "value": overall,
-                        "color": "#4A5568",
-                    }
-                )
-
-                for _, prow in parts_df.iterrows():
-                    pid = prow["id"]
-                    pname = prow["name"]
-                    pcolor = (
-                        prow["color"]
-                        if isinstance(prow["color"], str) and prow["color"]
-                        else "#3788d8"
-                    )
-                    ptasks = all_tasks[all_tasks["part_id"] == pid]
-                    val = completion_ratio(ptasks) if not ptasks.empty else 0
-                    items.append(
-                        {
-                            "label": pname,
-                            "value": val,
-                            "color": pcolor,
-                        }
-                    )
-
-                n_items = len(items)
-                max_cols = 4
-                idx = 0
-                while idx < n_items:
-                    cols = st.columns(min(max_cols, n_items - idx))
-                    for c in range(len(cols)):
-                        item = items[idx]
-                        with cols[c]:
-                            CircularProgress(
-                                label=item["label"],
-                                value=item["value"],
-                                key=f"cp_{item['label']}_{idx}",
-                                color=item["color"],
-                            ).st_circular_progress()
-                        idx += 1
+    render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER)
 
 # =========================================================
 # 프로젝트 관리 (admin)
@@ -1116,7 +1663,6 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
         if projects_df.empty:
             st.caption("등록된 프로젝트가 없습니다.")
         else:
-            # 실제 있는 컬럼만 사용
             wanted_cols = ["id", "name", "description", "created_at"]
             exist_cols = [c for c in wanted_cols if c in projects_df.columns]
 
@@ -1151,6 +1697,36 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
                 )
                 st.success("프로젝트가 수정되었습니다.")
                 st.rerun()
+
+        st.markdown("#### 프로젝트 삭제")
+        projects_df = list_projects()
+        if not projects_df.empty:
+            del_labels = [
+                f"{r['name']} (id={r['id']})" for _, r in projects_df.iterrows()
+            ]
+            del_sel = st.selectbox(
+                "삭제할 프로젝트 선택", del_labels, key="del_proj_sel"
+            )
+            del_idx = del_labels.index(del_sel)
+            del_row = projects_df.iloc[del_idx]
+            if st.button("선택한 프로젝트 삭제", key="del_proj_btn", type="secondary"):
+                st.session_state["confirm_del_project"] = int(del_row["id"])
+
+            if st.session_state.get("confirm_del_project") is not None:
+                pid = st.session_state["confirm_del_project"]
+                st.warning(
+                    f"정말 프로젝트(id={pid})를 삭제할까요? 관련 작업/권한도 함께 삭제됩니다."
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("네, 삭제합니다", key="del_proj_confirm_btn"):
+                        delete_project(pid)
+                        st.session_state.pop("confirm_del_project", None)
+                        st.success("프로젝트가 삭제되었습니다.")
+                        st.rerun()
+                with c2:
+                    if st.button("취소", key="del_proj_cancel_btn"):
+                        st.session_state.pop("confirm_del_project", None)
 
     with top_right:
         st.markdown("#### 파트 목록 / 수정")
