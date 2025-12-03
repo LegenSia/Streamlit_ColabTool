@@ -814,7 +814,7 @@ def completion_ratio(tasks_df: pd.DataFrame) -> int:
 # Fragment: 대시보드
 # =========================================================
 @st.fragment()
-def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER):
+def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER, role):
     st.subheader("📊 대시보드 (전체 파트 일정)")
 
     if not selected_project_id:
@@ -849,31 +849,25 @@ def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER):
         key="dashboard_calendar",
     )
 
+    # --- 날짜 선택: 문자열 기준으로 동작시키기 (타임존 오차 방지) ---
     key_sel = "dashboard_selected_date"
     default_sel = st.session_state.get(key_sel, date.today().isoformat())
+
     if isinstance(cal_val, dict) and cal_val.get("callback") == "dateClick":
         dc = cal_val.get("dateClick", {})
-        raw = (dc.get("dateStr") or dc.get("date") or "")[:10]
+        raw = dc.get("dateStr") or dc.get("date") or ""
+        raw = raw[:10]
         if raw:
             st.session_state[key_sel] = raw
             default_sel = raw
 
-    selected_day = date.fromisoformat(default_sel)
+    selected_day_str = default_sel
+    selected_day = date.fromisoformat(selected_day_str)
 
     def is_on_day(row):
-        due = row.get("due_date")
-        if isinstance(due, str) and due:
-            try:
-                d = date.fromisoformat(due)
-                return d == selected_day
-            except Exception:
-                return False
-        try:
-            if pd.notna(due):
-                return due.date() == selected_day
-        except Exception:
-            return False
-        return False
+        # due_date도 "YYYY-MM-DD" 문자열로 저장되어 있으므로 문자열로 비교
+        due_str = str(row.get("due_date") or "")[:10]
+        return due_str == selected_day_str
 
     day_tasks = (
         filtered[filtered.apply(is_on_day, axis=1)]
@@ -900,71 +894,55 @@ def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER):
             day_tasks[exist_cols], use_container_width=True, hide_index=True
         )
 
-        # 상세 업무 삭제 기능 (대시보드에서)
-        with st.expander("🗑 선택한 날짜 작업 삭제", expanded=False):
-            options = [
-                f"[{int(row['id'])}] {row['title']}"
-                for _, row in day_tasks.iterrows()
-            ]
-            sel = st.selectbox(
-                "삭제할 작업 선택",
-                options,
-                key="day_task_delete_select",
-            )
-            if st.button("선택한 작업 삭제", key="day_task_delete_btn"):
-                sel_id_str = sel.split("]")[0].replace("[", "")
-                try:
-                    tid = int(sel_id_str)
-                    delete_task(tid)
-                    st.success("작업이 삭제되었습니다.")
-                    st.rerun()
-                except Exception:
-                    st.error("삭제 중 오류가 발생했습니다.")
+    br_col, graph_col = st.columns([2, 2])
 
     br_col, graph_col = st.columns([2, 2])
 
     with br_col:
-        st.markdown("#### 🧍 나의 할 일 브리핑")
-        if filtered.empty:
-            st.caption("현재 프로젝트에 등록된 작업이 없습니다.")
-        else:
-            my_tasks = filtered[filtered["assignee"] == CURRENT_USER]
-            if my_tasks.empty:
-                st.caption(
-                    f"현재 프로젝트/필터에서 {CURRENT_USER}에게 배정된 작업이 없습니다."
-                )
+        # user 계정(=기획)일 때만 브리핑 출력
+        if role == "user":
+            st.markdown("#### 🧍 나의 할 일 브리핑")
+            if filtered.empty:
+                st.caption("현재 프로젝트에 등록된 작업이 없습니다.")
             else:
-                total = len(my_tasks)
-                by_status = my_tasks["status"].value_counts().to_dict()
-
-                def parse_due(x):
-                    try:
-                        if isinstance(x, str) and x:
-                            return date.fromisoformat(x)
-                        if pd.notna(x):
-                            return x.date()
-                        return None
-                    except Exception:
-                        return None
-
-                my_tasks = my_tasks.copy()
-                my_tasks["due_dt"] = my_tasks["due_date"].apply(parse_due)
-                upcoming = my_tasks.dropna(subset=["due_dt"]).sort_values("due_dt")
-                if not upcoming.empty:
-                    next_due = upcoming.iloc[0]
-                    next_due_date = next_due["due_dt"].isoformat()
-                    next_due_title = next_due["title"]
+                my_tasks = filtered[filtered["assignee"] == CURRENT_USER]
+                if my_tasks.empty:
+                    st.caption(
+                        f"현재 프로젝트/필터에서 {CURRENT_USER}에게 배정된 작업이 없습니다."
+                    )
                 else:
-                    next_due_date = "-"
-                    next_due_title = "-"
+                    total = len(my_tasks)
+                    by_status = my_tasks["status"].value_counts().to_dict()
 
-                st.markdown(
-                    f"- 총 작업 수: **{total}건**  "
-                    f"(Todo: {by_status.get('Todo', 0)}, In Progress: {by_status.get('In Progress', 0)}, Done: {by_status.get('Done', 0)})"
-                )
-                st.markdown(
-                    f"- 가장 가까운 마감: **{next_due_date} · {next_due_title}**"
-                )
+                    def parse_due(x):
+                        try:
+                            if isinstance(x, str) and x:
+                                return date.fromisoformat(x)
+                            if pd.notna(x):
+                                return x.date()
+                            return None
+                        except Exception:
+                            return None
+
+                    my_tasks = my_tasks.copy()
+                    my_tasks["due_dt"] = my_tasks["due_date"].apply(parse_due)
+                    upcoming = my_tasks.dropna(subset=["due_dt"]).sort_values("due_dt")
+                    if not upcoming.empty:
+                        next_due = upcoming.iloc[0]
+                        next_due_date = next_due["due_dt"].isoformat()
+                        next_due_title = next_due["title"]
+                    else:
+                        next_due_date = "-"
+                        next_due_title = "-"
+
+                    st.markdown(
+                        f"- 총 작업 수: **{total}건**  "
+                        f"(Todo: {by_status.get('Todo', 0)}, In Progress: {by_status.get('In Progress', 0)}, Done: {by_status.get('Done', 0)})"
+                    )
+                    st.markdown(
+                        f"- 가장 가까운 마감: **{next_due_date} · {next_due_title}**"
+                    )
+        # admin일 때는 이 칸 비워두기 (그래프만 오른쪽에서 보여줌)
 
     with graph_col:
         st.markdown("#### 전체 / 파트 진행률")
@@ -1647,7 +1625,13 @@ else:
 # 대시보드
 # =========================================================
 if current_tab == "대시보드":
-    render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER)
+    render_dashboard(
+        selected_project_id,
+        parts_df,
+        part_names,
+        CURRENT_USER,
+        st.session_state["role"],
+    )
 
 # =========================================================
 # 프로젝트 관리 (admin)
