@@ -2388,12 +2388,15 @@ else:
                                 else:
                                     # 수정 모드
                                     st.markdown("**수정 모드**")
+
+                                    # 제목
                                     title_val = st.text_input(
                                         "제목",
                                         value=r["title"],
                                         key=f"edit_title_{task_id}",
                                     )
 
+                                    # 담당자
                                     assignee_current = r["assignee"] or "(없음)"
                                     assignee_val = st.selectbox(
                                         "담당자",
@@ -2404,18 +2407,56 @@ else:
                                         key=f"edit_assignee_{task_id}",
                                     )
 
-                                    # 🔹 우선순위 수정 UI 추가
-                                    current_priority = r["priority"] or "Medium"
-                                    if current_priority not in priority_options:
-                                        current_priority = "Medium"
-                                    priority_val = st.selectbox(
-                                        "우선순위",
-                                        priority_options,
-                                        index=priority_options.index(current_priority),
-                                        format_func=lambda v: priority_labels.get(v, v),
-                                        key=f"edit_priority_{task_id}",
-                                    )
+                                    # 🔹 날짜 파싱 헬퍼
+                                    def _parse_date(v):
+                                        if isinstance(v, str) and v:
+                                            try:
+                                                return date.fromisoformat(v[:10])
+                                            except Exception:
+                                                pass
+                                        try:
+                                            if pd.notna(v):
+                                                return v.date()
+                                        except Exception:
+                                            pass
+                                        return date.today()
 
+                                    # 🔹 시작일 / 마감일 수정
+                                    c_d1, c_d2 = st.columns(2)
+                                    with c_d1:
+                                        start_date_val = st.date_input(
+                                            "시작일",
+                                            value=_parse_date(r.get("start_date")),
+                                            key=f"edit_start_{task_id}",
+                                        )
+                                    with c_d2:
+                                        due_date_val = st.date_input(
+                                            "마감일",
+                                            value=_parse_date(r.get("due_date")),
+                                            key=f"edit_due_{task_id}",
+                                        )
+
+                                    # 🔹 태그 + 우선순위 한 줄 반반
+                                    c_tag, c_pri = st.columns(2)
+                                    with c_tag:
+                                        tags_val = st.text_input(
+                                            "태그(쉼표 구분)",
+                                            value=r.get("tags") or "",
+                                            key=f"edit_tags_{task_id}",
+                                        )
+                                    with c_pri:
+                                        current_priority = r["priority"] or "Medium"
+                                        if current_priority not in priority_options:
+                                            current_priority = "Medium"
+                                        priority_val = st.selectbox(
+                                            "우선순위",
+                                            priority_options,
+                                            index=priority_options.index(current_priority),
+                                            format_func=lambda v: priority_labels.get(v, v),
+                                            key=f"edit_priority_{task_id}",
+                                        )
+
+                                    # 🔹 서브태스크 편집
                                     subtasks = parse_subtasks(
                                         r.get("description") or ""
                                     )
@@ -2447,15 +2488,7 @@ else:
                                                 (lbl.strip(), weight_val, d_done)
                                             )
 
-                                    # 🔹 태그 입력 영역을 조금 줄이고 사용
-                                    c_tag, c_dummy = st.columns([3, 1])
-                                    with c_tag:
-                                        tags_val = st.text_input(
-                                            "태그(쉼표 구분)",
-                                            value=r.get("tags") or "",
-                                            key=f"edit_tags_{task_id}",
-                                        )
-
+                                    # 🔹 저장 / 취소
                                     b1, b2 = st.columns(2, gap="small")
                                     with b1:
                                         if st.button(
@@ -2488,6 +2521,7 @@ else:
                                                 if assignee_val == "(없음)"
                                                 else assignee_val
                                             )
+
                                             update_task(
                                                 task_id,
                                                 title=title_val.strip()
@@ -2498,6 +2532,12 @@ else:
                                                 assignee=assignee_final,
                                                 tags=tags_val.strip() or None,
                                                 priority=priority_val,
+                                                start_date=start_date_val.isoformat()
+                                                if start_date_val
+                                                else None,
+                                                due_date=due_date_val.isoformat()
+                                                if due_date_val
+                                                else None,
                                             )
                                             st.session_state[edit_key] = False
                                             st.success("수정되었습니다.")
