@@ -224,7 +224,7 @@ def seed_if_empty():
         )
 
 
-# --- 변경: DB 초기화/시드 1회만 실행하도록 래핑 ---
+# --- DB 초기화/시드 1회만 실행하도록 래핑 ---
 @st.cache_resource(show_spinner=False)
 def ensure_db_initialized():
     init_db()
@@ -811,6 +811,39 @@ def completion_ratio(tasks_df: pd.DataFrame) -> int:
 
 
 # =========================================================
+# 날짜 클릭 값 정규화 (UTC→KST 보정 포함)
+# =========================================================
+def normalize_clicked_date(dc: dict) -> str | None:
+    """
+    streamlit-calendar의 dateClick 반환값을
+    'YYYY-MM-DD' 문자열로 안전하게 변환.
+    KST(+9) 기준으로 하루 밀리는 현상 방지.
+    """
+    raw = dc.get("dateStr") or dc.get("date") or ""
+    if not raw:
+        return None
+    raw = str(raw)
+
+    try:
+        # '2025-12-20' 형태 → 그대로 사용
+        if "T" not in raw:
+            return raw[:10]
+
+        # '2025-12-19T15:00:00Z' 같은 형태
+        s = raw.rstrip("Z")
+        dt = datetime.fromisoformat(s)
+
+        # raw가 UTC 기준이라고 가정하고 +9시간 (KST) 보정
+        if raw.endswith("Z"):
+            dt = dt + timedelta(hours=9)
+
+        return dt.date().isoformat()
+    except Exception:
+        # 실패하면 앞 10자리만 자르기
+        return raw[:10]
+
+
+# =========================================================
 # Fragment: 대시보드
 # =========================================================
 @st.fragment()
@@ -841,31 +874,35 @@ def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER, ro
     else:
         filtered = all_tasks
 
+    # --- 날짜 상태 기본값: 오늘 ---
+    key_sel = "dashboard_selected_date"
+    if key_sel not in st.session_state:
+        st.session_state[key_sel] = date.today().isoformat()
+    current_sel_str = st.session_state[key_sel]
+
     events = build_calendar_events(filtered, show_part_in_title=True)
     options = calendar_options_base()
+    # 탭 이동 후에도 캘린더가 마지막 선택 날짜를 기준으로 보이도록
+    options["initialDate"] = current_sel_str
+
     cal_val = st_calendar(
         events=events,
         options=options,
         key="dashboard_calendar",
     )
 
-    # --- 날짜 선택: 문자열 기준으로 동작시키기 (타임존 오차 방지) ---
-    key_sel = "dashboard_selected_date"
-    default_sel = st.session_state.get(key_sel, date.today().isoformat())
-
+    # --- 날짜 클릭 콜백 처리 ---
     if isinstance(cal_val, dict) and cal_val.get("callback") == "dateClick":
         dc = cal_val.get("dateClick", {})
-        raw = dc.get("dateStr") or dc.get("date") or ""
-        raw = raw[:10]
-        if raw:
-            st.session_state[key_sel] = raw
-            default_sel = raw
+        clicked = normalize_clicked_date(dc)
+        if clicked:
+            st.session_state[key_sel] = clicked
+            current_sel_str = clicked
 
-    selected_day_str = default_sel
+    selected_day_str = current_sel_str
     selected_day = date.fromisoformat(selected_day_str)
 
     def is_on_day(row):
-        # due_date도 "YYYY-MM-DD" 문자열로 저장되어 있으므로 문자열로 비교
         due_str = str(row.get("due_date") or "")[:10]
         return due_str == selected_day_str
 
@@ -893,8 +930,6 @@ def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER, ro
         st.dataframe(
             day_tasks[exist_cols], use_container_width=True, hide_index=True
         )
-
-    br_col, graph_col = st.columns([2, 2])
 
     br_col, graph_col = st.columns([2, 2])
 
@@ -942,7 +977,7 @@ def render_dashboard(selected_project_id, parts_df, part_names, CURRENT_USER, ro
                     st.markdown(
                         f"- 가장 가까운 마감: **{next_due_date} · {next_due_title}**"
                     )
-        # admin일 때는 이 칸 비워두기 (그래프만 오른쪽에서 보여줌)
+        # admin일 때는 이 칸 비워두기
 
     with graph_col:
         st.markdown("#### 전체 / 파트 진행률")
@@ -1018,23 +1053,30 @@ def render_part_board(
     part_id = int(part_row["id"].iloc[0])
     tdf = list_tasks(project_id=selected_project_id, part_id=part_id)
 
+    # --- 날짜 상태 기본값: 오늘 ---
+    key_sel = f"part_{part_id}_selected_date"
+    if key_sel not in st.session_state:
+        st.session_state[key_sel] = date.today().isoformat()
+    current_sel_str = st.session_state[key_sel]
+
     events = build_calendar_events(tdf, show_part_in_title=False)
     options = calendar_options_base()
+    options["initialDate"] = current_sel_str
+
     cal_val = st_calendar(
         events=events,
         options=options,
         key=f"calendar_part_{part_id}",
     )
 
-    key_sel = f"part_{part_id}_selected_date"
-    default_sel = st.session_state.get(key_sel, date.today().isoformat())
     if isinstance(cal_val, dict) and cal_val.get("callback") == "dateClick":
         dc = cal_val.get("dateClick", {})
-        raw = (dc.get("dateStr") or dc.get("date") or "")[:10]
-        if raw:
-            st.session_state[key_sel] = raw
-            default_sel = raw
-    selected_day = date.fromisoformat(default_sel)
+        clicked = normalize_clicked_date(dc)
+        if clicked:
+            st.session_state[key_sel] = clicked
+            current_sel_str = clicked
+
+    selected_day = date.fromisoformat(current_sel_str)
 
     with st.expander("🔍 필터", expanded=False):
         f1, f2, f3, f4 = st.columns(4)
