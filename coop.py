@@ -348,6 +348,23 @@ def insert_part(name, color="#3788d8"):
     # --- 캐시 무효화 ---
     list_parts.clear()
 
+def delete_part(part_id):
+    """파트 삭제 (연관 작업/유저-파트 매핑도 정리)"""
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        # 이 파트에 속한 작업 삭제
+        cur.execute("DELETE FROM tasks WHERE part_id=%s", (part_id,))
+        # 유저-파트 매핑 삭제
+        cur.execute("DELETE FROM user_parts WHERE part_id=%s", (part_id,))
+        # 실제 파트 삭제
+        cur.execute("DELETE FROM parts WHERE id=%s", (part_id,))
+        conn.commit()
+
+    # 캐시 무효화
+    list_parts.clear()
+    list_tasks.clear()
+    get_parts_for_user.clear()
+    get_users_for_part.clear()
 
 def update_part(part_id, **kwargs):
     sets = []
@@ -367,6 +384,7 @@ def update_part(part_id, **kwargs):
         conn.commit()
     # --- 캐시 무효화 ---
     list_parts.clear()
+
 
 
 def insert_user(name, email, part_ids, role):
@@ -1750,77 +1768,85 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
 
     top_left, top_right = st.columns(2)
 
+    # ----------------------------
+    # 프로젝트 목록 / 수정 / 삭제
+    # ----------------------------
     with top_left:
-        st.markdown("#### 프로젝트 목록")
+        st.markdown("#### 프로젝트 목록 / 수정")
+
         projects_df = list_projects()
         if projects_df.empty:
             st.caption("등록된 프로젝트가 없습니다.")
         else:
-            wanted_cols = ["id", "name", "description", "created_at"]
-            exist_cols = [c for c in wanted_cols if c in projects_df.columns]
+            for _, row in projects_df.iterrows():
+                pid = int(row["id"])
+                c1, c2, c3 = st.columns([3, 3, 2])
 
-            st.dataframe(
-                projects_df[exist_cols],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.markdown("#### 프로젝트 이름 수정")
-        projects_df = list_projects()
-        if not projects_df.empty:
-            proj_labels = [
-                f"{r['name']} (id={r['id']})" for _, r in projects_df.iterrows()
-            ]
-            sel_label = st.selectbox(
-                "수정할 프로젝트 선택", proj_labels, key="edit_proj_sel"
-            )
-            idx = proj_labels.index(sel_label)
-            row = projects_df.iloc[idx]
-            new_name = st.text_input(
-                "새 이름", value=row["name"], key="edit_proj_name"
-            )
-            new_desc = st.text_input(
-                "새 설명", value=row.get("description") or "", key="edit_proj_desc"
-            )
-            if st.button("프로젝트 수정"):
-                update_project(
-                    int(row["id"]),
-                    name=new_name.strip() or row["name"],
-                    description=new_desc.strip(),
-                )
-                st.success("프로젝트가 수정되었습니다.")
-                st.rerun()
-
-        st.markdown("#### 프로젝트 삭제")
-        projects_df = list_projects()
-        if not projects_df.empty:
-            del_labels = [
-                f"{r['name']} (id={r['id']})" for _, r in projects_df.iterrows()
-            ]
-            del_sel = st.selectbox(
-                "삭제할 프로젝트 선택", del_labels, key="del_proj_sel"
-            )
-            del_idx = del_labels.index(del_sel)
-            del_row = projects_df.iloc[del_idx]
-            if st.button("선택한 프로젝트 삭제", key="del_proj_btn", type="secondary"):
-                st.session_state["confirm_del_project"] = int(del_row["id"])
-
-            if st.session_state.get("confirm_del_project") is not None:
-                pid = st.session_state["confirm_del_project"]
-                st.warning(
-                    f"정말 프로젝트(id={pid})를 삭제할까요? 관련 작업/권한도 함께 삭제됩니다."
-                )
-                c1, c2 = st.columns(2)
                 with c1:
-                    if st.button("네, 삭제합니다", key="del_proj_confirm_btn"):
-                        delete_project(pid)
-                        st.session_state.pop("confirm_del_project", None)
-                        st.success("프로젝트가 삭제되었습니다.")
-                        st.rerun()
+                    new_name = st.text_input(
+                        "프로젝트 이름",
+                        value=row["name"],
+                        key=f"proj_name_{pid}",
+                        label_visibility="collapsed",
+                    )
                 with c2:
-                    if st.button("취소", key="del_proj_cancel_btn"):
-                        st.session_state.pop("confirm_del_project", None)
+                    new_desc = st.text_input(
+                        "설명",
+                        value=row.get("description") or "",
+                        key=f"proj_desc_{pid}",
+                        label_visibility="collapsed",
+                    )
+                with c3:
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        if st.button(
+                            "저장",
+                            key=f"proj_save_{pid}",
+                            use_container_width=True,
+                        ):
+                            update_project(
+                                pid,
+                                name=new_name.strip() or row["name"],
+                                description=new_desc.strip(),
+                            )
+                            st.success("프로젝트가 수정되었습니다.")
+                            st.rerun()
+                    with b2:
+                        if st.button(
+                            "삭제",
+                            key=f"proj_del_{pid}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["confirm_del_project"] = pid
 
+        # 프로젝트 삭제 확인
+        if st.session_state.get("confirm_del_project") is not None:
+            pid = st.session_state["confirm_del_project"]
+            st.warning(
+                f"정말 프로젝트(id={pid})를 삭제할까요? 관련 작업/권한도 함께 삭제됩니다."
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(
+                    "네, 삭제합니다",
+                    key="proj_del_confirm_btn",
+                    use_container_width=True,
+                ):
+                    delete_project(pid)
+                    st.session_state.pop("confirm_del_project", None)
+                    st.success("프로젝트가 삭제되었습니다.")
+                    st.rerun()
+            with c2:
+                if st.button(
+                    "취소",
+                    key="proj_del_cancel_btn",
+                    use_container_width=True,
+                ):
+                    st.session_state.pop("confirm_del_project", None)
+
+    # ----------------------------
+    # 파트 목록 / 수정 / 삭제
+    # ----------------------------
     with top_right:
         st.markdown("#### 파트 목록 / 수정")
         parts_df = list_parts()
@@ -1828,12 +1854,13 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
             st.caption("등록된 파트가 없습니다.")
         else:
             for _, row in parts_df.iterrows():
-                c1, c2, c3 = st.columns([3, 2, 1])
+                pid = int(row["id"])
+                c1, c2, c3 = st.columns([3, 2, 2])
                 with c1:
                     new_part_name = st.text_input(
                         "이름",
                         value=row["name"],
-                        key=f"part_name_{row['id']}",
+                        key=f"part_name_{pid}",
                         label_visibility="collapsed",
                     )
                 with c2:
@@ -1845,18 +1872,56 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
                     color_val = st.color_picker(
                         "색상",
                         current_color,
-                        key=f"part_color_{row['id']}",
+                        key=f"part_color_{pid}",
                         label_visibility="collapsed",
                     )
                 with c3:
-                    if st.button("저장", key=f"save_part_{row['id']}"):
-                        update_part(
-                            row["id"],
-                            name=new_part_name.strip() or row["name"],
-                            color=color_val,
-                        )
-                        st.success(f"{row['name']} 파트가 업데이트되었습니다.")
-                        st.rerun()
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        if st.button(
+                            "저장",
+                            key=f"save_part_{pid}",
+                            use_container_width=True,
+                        ):
+                            update_part(
+                                pid,
+                                name=new_part_name.strip() or row["name"],
+                                color=color_val,
+                            )
+                            st.success(f"{row['name']} 파트가 업데이트되었습니다.")
+                            st.rerun()
+                    with b2:
+                        if st.button(
+                            "삭제",
+                            key=f"del_part_{pid}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["confirm_del_part"] = pid
+
+        # 파트 삭제 확인
+        if st.session_state.get("confirm_del_part") is not None:
+            pid = st.session_state["confirm_del_part"]
+            st.warning(
+                f"정말 파트(id={pid})를 삭제할까요? 관련 작업/유저-파트 연결도 함께 삭제됩니다."
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(
+                    "네, 삭제합니다",
+                    key="part_del_confirm_btn",
+                    use_container_width=True,
+                ):
+                    delete_part(pid)
+                    st.session_state.pop("confirm_del_part", None)
+                    st.success("파트가 삭제되었습니다.")
+                    st.rerun()
+            with c2:
+                if st.button(
+                    "취소",
+                    key="part_del_cancel_btn",
+                    use_container_width=True,
+                ):
+                    st.session_state.pop("confirm_del_part", None)
 
     st.markdown("---")
 
