@@ -1649,7 +1649,7 @@ if "logged_in" not in st.session_state:
 
 # 로그인
 if not st.session_state["logged_in"]:
-    st.title("협업툴 로그인")
+    st.title("협업툴 로그인 (ID: admin, PW: 1234")
 
     with st.form("login_form"):
         company = st.selectbox("회사", [COMPANY_NAME], index=0)
@@ -2684,4 +2684,5 @@ else:
                             tags=tags.strip() or None,
                         )
                         st.success("작업이 추가되었습니다.")
+
                         st.rerun()
